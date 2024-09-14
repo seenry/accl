@@ -542,13 +542,27 @@ ncclResult_t ncclProxySaveOp(struct ncclComm* comm, struct ncclProxyOp* op, bool
   case ncclPatternRingTwice:
   case ncclPatternPipelineFrom:
   case ncclPatternPipelineTo: {
-      struct ncclRing* ring = &channel->ring;
-      if (NeedProxy(proxyRecv, op->pattern, op->root, ring, comm->nRanks)) {
-        NCCLCHECK(SaveProxy(comm, channel, proxyRecv, ring->prev, op, 0, justInquire));
-      }
-      if (NeedProxy(proxySend, op->pattern, op->root, ring, comm->nRanks)) {
-        NCCLCHECK(SaveProxy(comm, channel, proxySend, ring->next, op, 0, justInquire));
-      }
+      // struct ncclRing* ring = &channel->ring;
+      // if (NeedProxy(proxyRecv, op->pattern, op->root, ring, comm->nRanks)) {
+      //   NCCLCHECK(SaveProxy(comm, channel, proxyRecv, ring->prev, op, 0, justInquire));
+      // }
+      // if (NeedProxy(proxySend, op->pattern, op->root, ring, comm->nRanks)) {
+      //   NCCLCHECK(SaveProxy(comm, channel, proxySend, ring->next, op, 0, justInquire));
+      // }
+      int rank_inter = (comm->rank / NCCL_KPARAM) * NCCL_KPARAM;
+      int rank_intra = comm->rank % NCCL_KPARAM;
+      int prev[2] = {
+        rank_inter                                       + ((rank_intra + NCCL_KPARAM - 1) % NCCL_KPARAM),
+        ((rank_inter + comm->nRanks - NCCL_KPARAM) % comm->nRanks) + rank_intra
+      };
+      int next[2] = {
+        rank_inter                        + ((rank_intra + 1) % NCCL_KPARAM),
+        ((rank_inter + NCCL_KPARAM) % comm->nRanks) + rank_intra
+      };
+      NCCLCHECK(SaveProxy(comm, channel, proxyRecv, prev[0], op, 0, justInquire));
+      NCCLCHECK(SaveProxy(comm, channel, proxyRecv, prev[1], op, 0, justInquire));
+      NCCLCHECK(SaveProxy(comm, channel, proxySend, next[0], op, 0, justInquire));
+      NCCLCHECK(SaveProxy(comm, channel, proxySend, next[1], op, 0, justInquire));
     } break;
   case ncclPatternTreeUp:
   case ncclPatternTreeDown:

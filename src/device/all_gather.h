@@ -57,13 +57,127 @@ namespace {
       prims.directRecv(offset, nelem);
     }
   }
+
+  template<typename T, typename RedOp, typename Proto>
+  __device__ __forceinline__ void runOuter(int tid, int nthreads, struct ncclDevWorkColl* work) {
+    ncclRing *ring = &ncclShmem.channel.ring;
+    const int *ringRanks = ring->userRanks;
+    const int nranks = ncclShmem.comm.nRanks;
+    size_t count, partOffset, partCount, chunkCount;
+    ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &count, &partOffset, &partCount, &chunkCount);
+    size_t offset;
+    size_t dataOffset;
+    int nelem;
+    int rankDest;
+
+    int rank_inter = (ringRanks[0] / NCCL_KPARAM) * NCCL_KPARAM;
+    int rank_intra = ringRanks[0] % NCCL_KPARAM;
+    int prev = ((rank_inter + nranks - NCCL_KPARAM) % nranks) + rank_intra;
+    int next = ((rank_inter + NCCL_KPARAM) % nranks) + rank_intra;
+
+    T *inputBuf = (T*)work->sendbuff;
+    T *outputBuf = (T*)work->recvbuff;
+    Primitives<T, RedOp, FanSymmetric<1>, 1, Proto, 0> prims
+      (tid, nthreads, &prev, &next, inputBuf, outputBuf, work->redOpArg);
+
+    for (size_t elemOffset = 0; elemOffset < partCount; elemOffset += chunkCount) {
+      /////////////// begin AllGather steps ///////////////
+      nelem = min(chunkCount, partCount - elemOffset);
+      dataOffset = partOffset + elemOffset;
+
+      // step 0: push data to next GPU
+      rankDest = rank_inter + rank_intra;
+      offset = dataOffset + rankDest * count;
+
+      if (inputBuf + dataOffset == outputBuf + offset) { // In place
+        prims.directSend(dataOffset, offset, nelem);
+      } else {
+        prims.directCopySend(dataOffset, offset, nelem);
+      }
+
+      // k-2 steps: copy to next GPU
+      for (int j=NCCL_KPARAM; j < nranks - NCCL_KPARAM; ++j) {
+        rankDest = (rankDest + nranks - j) % nranks;
+        offset = dataOffset + rankDest * count;
+
+        prims.directRecvCopySend(offset, nelem);
+      }
+
+      // Make final copy from buffer to dest.
+      rankDest = (rankDest + nranks - NCCL_KPARAM) % nranks;
+      offset = dataOffset + rankDest * count;
+
+      // Final wait/copy.
+      prims.directRecv(offset, nelem);
+    }
+  }
+
+  template<typename T, typename RedOp, typename Proto>
+  __device__ __forceinline__ void runInner(int tid, int nthreads, struct ncclDevWorkColl* work) {
+    ncclRing *ring = &ncclShmem.channel.ring;
+    const int *ringRanks = ring->userRanks;
+    const int nranks = ncclShmem.comm.nRanks;
+    size_t count, partOffset, partCount, chunkCount;
+    ncclCollCbdPart(work, ncclShmem.channelId, Proto::Id, sizeof(T), &count, &partOffset, &partCount, &chunkCount);
+    size_t offset;
+    size_t dataOffset;
+    int nelem;
+    int rankDest;
+
+    int rank_inter = (ringRanks[0] / NCCL_KPARAM) * NCCL_KPARAM;
+    int rank_intra = ringRanks[0] % NCCL_KPARAM;
+    int prev = rank_inter + ((rank_intra + NCCL_KPARAM - 1) % NCCL_KPARAM);
+    int next = rank_inter + ((rank_intra + 1) % NCCL_KPARAM);
+
+    T *inputBuf = (T*)work->sendbuff;
+    T *outputBuf = (T*)work->recvbuff;
+    Primitives<T, RedOp, FanSymmetric<1>, 1, Proto, 0> prims
+      (tid, nthreads, &prev, &next, inputBuf, outputBuf, work->redOpArg);
+
+    for (size_t elemOffset = 0; elemOffset < partCount; elemOffset += chunkCount) {
+      /////////////// begin AllGather steps ///////////////
+      nelem = min(chunkCount, partCount - elemOffset);
+      dataOffset = partOffset + elemOffset;
+
+      for (int inter_off = 0; inter_off < nranks; inter_off += NCCL_KPARAM) {
+        // step 0: push data to next GPU
+        rankDest = rank_inter + rank_intra;
+        offset = dataOffset + rankDest * count;
+
+        if (inputBuf + dataOffset == outputBuf + offset) { // In place
+          prims.directSend(dataOffset, offset, nelem);
+        } else {
+          prims.directSendFromOutput(offset, nelem);
+        }
+
+        // k-2 steps: copy to next GPU
+        for (int j=1; j<NCCL_KPARAM-1; ++j) {
+          rankDest = rank_inter + ((rank_intra + NCCL_KPARAM - j) % NCCL_KPARAM);
+          offset = dataOffset + rankDest * count;
+
+          prims.directRecvCopySend(offset, nelem);
+        }
+
+        // Make final copy from buffer to dest.
+        rankDest = rank_inter + ((rank_intra + 1) % NCCL_KPARAM);
+        offset = dataOffset + rankDest * count;
+
+        // Final wait/copy.
+        prims.directRecv(offset, nelem);
+
+        rank_inter = (rank_inter + NCCL_KPARAM) % nranks;
+      }
+    }
+  }
 }
 
 template<typename T, typename RedOp>
 struct RunWorkColl<ncclFuncAllGather, T, RedOp, NCCL_ALGO_RING, NCCL_PROTO_SIMPLE> {
   __device__ __forceinline__ void run(int tid, int nthreads, struct ncclDevWorkColl* work) {
     using Proto = ProtoSimple<ALLGATHER_CHUNKSTEPS/ALLGATHER_SLICESTEPS, ALLGATHER_SLICESTEPS>;
-    runRing<T, RedOp, Proto>(tid, nthreads, work);
+    // runRing<T, RedOp, Proto>(tid, nthreads, work);
+    runOuter<T, RedOp, Proto>(tid, nthreads, work);
+    runInner<T, RedOp, Proto>(tid, nthreads, work);
   }
 };
 
